@@ -41,6 +41,7 @@ _secret_cache: dict[str, str] = {}
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, list[dict]]:
     """
     SQS trigger entry point.
