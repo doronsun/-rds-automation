@@ -23,7 +23,6 @@ Parameters:
   # secret ARN created during setup. Update the stack after the first cluster is provisioned.
   RdsSecretArn:
     Type: String
-    Default: "arn:aws:secretsmanager:us-east-1:220755213262:secret:dev/rds-automation/rds-placeholder"
 
   GitHubRepo:
     Type: String
