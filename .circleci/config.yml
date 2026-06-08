@@ -1,0 +1,403 @@
+version: 2.1
+
+# =============================================================================
+# SERVERLESS RDS CLUSTER AUTOMATION — CircleCI Pipeline
+#
+# Two primary workflows:
+#   pr-checks  → runs on every non-main branch (lint, validate, plan)
+#   deploy     → runs on every merge to main   (SAM deploy + Terraform apply)
+#
+# Required CircleCI Contexts:
+#   aws-readonly  — for plan-only operations on PRs
+#     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+#     TF_STATE_BUCKET, TF_VPC_ID, TF_SUBNET_IDS, TF_ALLOWED_SGS
+#
+#   aws-deploy    — for deploy/apply operations on main
+#     (all of the above, plus:)
+#     SAM_STACK_NAME, SAM_ARTIFACT_BUCKET, DEPLOY_ENVIRONMENT
+#     RDS_SECRET_ARN, GITHUB_TOKEN_SECRET_ARN
+#     LAMBDA_SUBNET_IDS, LAMBDA_SG_ID
+#     GITHUB_REPO, GITHUB_BASE_BRANCH
+#
+# TF_SUBNET_IDS and TF_ALLOWED_SGS must be JSON-encoded lists, e.g.:
+#   TF_SUBNET_IDS  = ["subnet-aaa","subnet-bbb"]
+#   TF_ALLOWED_SGS = ["sg-xxx"]
+#
+# The clusters/ directory must contain a pre-committed backend.tf and
+# variables.tf (vpc_id, subnet_ids, allowed_security_group_ids) before
+# Lambda-generated .tf files can be applied.
+# =============================================================================
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PIPELINE PARAMETERS
+# Non-sensitive defaults; all sensitive values come from CircleCI Contexts.
+# ──────────────────────────────────────────────────────────────────────────────
+parameters:
+  aws_region:
+    type: string
+    default: "us-east-1"
+  deploy_environment:
+    type: string
+    default: "dev"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXECUTORS
+# ──────────────────────────────────────────────────────────────────────────────
+executors:
+  # Official AWS SAM build image — matches Lambda python3.12 runtime exactly.
+  # Includes: sam, python3.12, pip, aws-cli, git.
+  sam-builder:
+    docker:
+      - image: public.ecr.aws/sam/build-python3.12:latest
+    environment:
+      AWS_DEFAULT_REGION: << pipeline.parameters.aws_region >>
+
+  # Official HashiCorp image — minimal Alpine, no git by default.
+  # Jobs that need git must call the install-git command first.
+  tf-runner:
+    docker:
+      - image: hashicorp/terraform:1.8
+    environment:
+      AWS_DEFAULT_REGION: << pipeline.parameters.aws_region >>
+
+  # CircleCI convenience image — git, curl, python3 included.
+  python-ci:
+    docker:
+      - image: cimg/python:3.12
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REUSABLE COMMANDS (DRY — avoids copy-pasting across jobs)
+# ──────────────────────────────────────────────────────────────────────────────
+commands:
+  install-git:
+    description: "Install git in Alpine-based images (hashicorp/terraform uses Alpine)"
+    steps:
+      - run:
+          name: Install git
+          command: apk add --no-cache git
+
+  detect-changes:
+    description: |
+      Gracefully halt the job (exit 0) if no files under `path` changed.
+      This is the mechanism that makes deploy-sam and terraform-apply
+      path-triggered rather than always-on.
+    parameters:
+      path:
+        type: string
+        description: "Directory or glob to check for changes, e.g. 'serverless/'"
+    steps:
+      - run:
+          name: "Detect changes — << parameters.path >>"
+          command: |
+            # On the first commit ever, there is no parent — treat as fully changed.
+            BASE="${CIRCLE_SHA1}~1"
+            if ! git rev-parse --verify "${BASE}" >/dev/null 2>&1; then
+              echo "No parent commit — assuming all files are new. Proceeding."
+              exit 0
+            fi
+
+            CHANGED=$(git diff --name-only "${BASE}" HEAD -- << parameters.path >> 2>/dev/null || true)
+
+            if [ -z "$CHANGED" ]; then
+              echo "No changes detected in << parameters.path >> — halting job."
+              # circleci-agent step halt ends the JOB (not just the step) with exit 0.
+              # The job appears green in the pipeline but is marked "Halted".
+              circleci-agent step halt
+            fi
+
+            echo "Changed files in << parameters.path >>:"
+            echo "${CHANGED}"
+
+  verify-aws-auth:
+    description: |
+      Validate that AWS credentials are available and working.
+      Credentials flow in from CircleCI Context env vars — nothing is stored here.
+    steps:
+      - run:
+          name: Verify AWS credentials
+          command: |
+            # AWS SDK/CLI auto-reads AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+            # AWS_DEFAULT_REGION from the environment — no `aws configure` needed.
+            # This call validates without printing any secret values.
+            aws sts get-caller-identity --output table
+
+  terraform-init-clusters:
+    description: "Init Terraform with S3 backend — all values from env vars"
+    steps:
+      - run:
+          name: Terraform init
+          command: |
+            cd clusters
+            # Partial backend config — bucket/key/region injected at runtime.
+            # The backend.tf in clusters/ contains only: terraform { backend "s3" {} }
+            terraform init \
+              -backend-config="bucket=${TF_STATE_BUCKET}" \
+              -backend-config="key=clusters/terraform.tfstate" \
+              -backend-config="region=${AWS_DEFAULT_REGION}" \
+              -input=false
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOBS
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── 1. Lint & Unit Test ─────────────────────────────────────────────────────
+  # Runs on all branches. No AWS credentials required.
+  lint-and-test:
+    executor: python-ci
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - pip-v2-{{ checksum "serverless/src/requirements.txt" }}
+            - pip-v2-
+      - run:
+          name: Install dependencies and dev tools
+          command: |
+            pip install --quiet --upgrade pip
+            pip install --quiet -r serverless/src/requirements.txt
+            pip install --quiet flake8 pytest pytest-cov
+      - save_cache:
+          key: pip-v2-{{ checksum "serverless/src/requirements.txt" }}
+          paths:
+            - ~/.cache/pip
+      - run:
+          name: "Lint — flake8"
+          command: |
+            flake8 serverless/src/ \
+              --max-line-length=120 \
+              --exclude=__pycache__,.venv
+      - run:
+          name: "Unit tests — pytest"
+          command: |
+            if [ -d serverless/tests ]; then
+              pytest serverless/tests/ -v \
+                --cov=serverless/src \
+                --cov-report=xml:test-results/coverage.xml
+            else
+              echo "No tests/ directory found — skipping"
+            fi
+      - store_test_results:
+          path: test-results
+
+  # ── 2. Terraform Validate ───────────────────────────────────────────────────
+  # Syntax-checks the rds-cluster module with no backend, no AWS credentials.
+  terraform-validate:
+    executor: tf-runner
+    steps:
+      - checkout
+      - install-git
+      - run:
+          name: "Terraform validate — terraform-modules/rds-cluster"
+          command: |
+            cd terraform-modules/rds-cluster
+            # -backend=false: skip state backend initialisation (no AWS needed)
+            terraform init -backend=false -input=false
+            terraform validate
+            echo "Module validation passed."
+
+  # ── 3. SAM Build + Deploy ───────────────────────────────────────────────────
+  # Runs on main only. Automatically halts (exit 0) if serverless/ has no changes.
+  # All parameter values injected from CircleCI Context 'aws-deploy'.
+  deploy-sam:
+    executor: sam-builder
+    steps:
+      - checkout
+      - detect-changes:
+          path: "serverless/"
+      - verify-aws-auth
+      - run:
+          name: "SAM build"
+          command: |
+            cd serverless
+            # No --use-container needed: executor image IS the python3.12 Lambda runtime.
+            # Add --use-container (+ machine executor) if native C extensions are required.
+            sam build
+      - run:
+          name: "SAM deploy"
+          # Zero hardcoded values — every flag sourced from CircleCI Context env vars.
+          # samconfig.toml is in .gitignore; all config lives in CI.
+          command: |
+            cd serverless
+            sam deploy \
+              --stack-name              "${SAM_STACK_NAME}" \
+              --s3-bucket               "${SAM_ARTIFACT_BUCKET}" \
+              --region                  "${AWS_DEFAULT_REGION}" \
+              --capabilities            CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+              --no-confirm-changeset \
+              --no-fail-on-empty-changeset \
+              --parameter-overrides \
+                "Environment=${DEPLOY_ENVIRONMENT}" \
+                "RdsSecretArn=${RDS_SECRET_ARN}" \
+                "GitHubTokenSecretArn=${GITHUB_TOKEN_SECRET_ARN}" \
+                "LambdaSubnetIds=${LAMBDA_SUBNET_IDS}" \
+                "LambdaSecurityGroupId=${LAMBDA_SG_ID}"
+      - run:
+          name: Print CloudFormation stack outputs
+          command: |
+            aws cloudformation describe-stacks \
+              --stack-name "${SAM_STACK_NAME}" \
+              --region     "${AWS_DEFAULT_REGION}" \
+              --query      "Stacks[0].Outputs" \
+              --output     table
+          when: on_success
+
+  # ── 4. Terraform Plan ───────────────────────────────────────────────────────
+  # Runs on PRs (read-only validation) and on main (plan before approval gate).
+  # Halts gracefully if clusters/ has no changes.
+  # Persists the plan artifact to workspace for terraform-apply to consume.
+  terraform-plan:
+    executor: tf-runner
+    steps:
+      - checkout
+      - install-git
+      - detect-changes:
+          path: "clusters/"
+      - verify-aws-auth
+      - terraform-init-clusters
+      - run:
+          name: "Terraform plan"
+          command: |
+            cd clusters
+            terraform plan \
+              -var "vpc_id=${TF_VPC_ID}" \
+              -var "subnet_ids=${TF_SUBNET_IDS}" \
+              -var "allowed_security_group_ids=${TF_ALLOWED_SGS}" \
+              -input=false \
+              -out=tfplan
+          # The plan is saved to clusters/tfplan and persisted below.
+          # The apply job uses this exact artifact — it cannot apply a different plan.
+      - persist_to_workspace:
+          root: .
+          paths:
+            - clusters/.terraform      # Provider plugins + lock file
+            - clusters/tfplan          # The approved plan artifact
+
+  # ── 5. Terraform Apply ──────────────────────────────────────────────────────
+  # Runs on main ONLY, and ONLY after the manual approval job below.
+  # Applies the exact plan produced by terraform-plan — no re-planning.
+  # Halts gracefully if clusters/ has no changes (mirrors plan logic).
+  terraform-apply:
+    executor: tf-runner
+    steps:
+      - checkout
+      # Re-attach the .terraform dir and tfplan from the plan job.
+      # This guarantees apply uses the same providers and the reviewed plan.
+      - attach_workspace:
+          at: .
+      - install-git
+      - detect-changes:
+          path: "clusters/"
+      - verify-aws-auth
+      # Re-init to reconnect to the S3 state backend (providers already cached).
+      - terraform-init-clusters
+      - run:
+          name: "Terraform apply — execute approved plan"
+          command: |
+            cd clusters
+            # -auto-approve is safe here because a human approved the plan artifact above.
+            terraform apply -auto-approve tfplan
+      - run:
+          name: Print Terraform outputs
+          command: |
+            cd clusters
+            # Filter sensitive outputs — DB passwords must be fetched from Secrets Manager.
+            terraform output -json | python3 -c "
+            import json, sys
+            outputs = json.load(sys.stdin)
+            if not outputs:
+                print('  (no outputs defined)')
+            for k, v in outputs.items():
+                val = '[sensitive — see Secrets Manager]' if v.get('sensitive') else v['value']
+                print(f'  {k} = {val}')
+            "
+          when: on_success
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WORKFLOWS
+# ──────────────────────────────────────────────────────────────────────────────
+workflows:
+
+  # ─── PR Checks ──────────────────────────────────────────────────────────────
+  # Trigger: any push to a non-main branch.
+  # Purpose: fast feedback loop before code reaches main.
+  # No deploys, no applies — read-only and validation only.
+  pr-checks:
+    jobs:
+      - lint-and-test:
+          filters:
+            branches:
+              ignore: main
+
+      - terraform-validate:
+          filters:
+            branches:
+              ignore: main
+
+      # Runs a full terraform plan against the real S3 state so reviewers can
+      # see what a merge would actually provision before approving the PR.
+      - terraform-plan:
+          context:
+            - aws-readonly
+          filters:
+            branches:
+              ignore: main
+
+  # ─── Deploy (merge to main) ──────────────────────────────────────────────────
+  # Trigger: any merge/push to main.
+  # Two independent paths run in parallel after lint-and-test:
+  #   Path A — SAM:       lint → deploy-sam         (if serverless/ changed)
+  #   Path B — Terraform: lint → plan → [approval] → apply  (if clusters/ changed)
+  deploy:
+    jobs:
+      # ── Shared gate ────────────────────────────────────────────────────────
+      - lint-and-test:
+          filters:
+            branches:
+              only: main
+
+      # ── Path A: SAM deploy ─────────────────────────────────────────────────
+      # Auto-halts if serverless/ did not change.
+      - deploy-sam:
+          context:
+            - aws-deploy
+          requires:
+            - lint-and-test
+          filters:
+            branches:
+              only: main
+
+      # ── Path B: Terraform plan ─────────────────────────────────────────────
+      # Auto-halts if clusters/ did not change.
+      - terraform-plan:
+          context:
+            - aws-deploy
+          requires:
+            - lint-and-test
+          filters:
+            branches:
+              only: main
+
+      # ── Manual approval gate ───────────────────────────────────────────────
+      # A human must review the Terraform plan output and click "Approve" in
+      # the CircleCI UI before terraform-apply is allowed to run.
+      # This prevents unreviewed RDS cluster provisioning in production.
+      - hold-for-approval:
+          type: approval
+          requires:
+            - terraform-plan
+          filters:
+            branches:
+              only: main
+
+      # ── Path B: Terraform apply ────────────────────────────────────────────
+      # Runs only after explicit human approval.
+      # Applies the exact plan artifact produced by terraform-plan above.
+      - terraform-apply:
+          context:
+            - aws-deploy
+          requires:
+            - hold-for-approval
+          filters:
+            branches:
+              only: main

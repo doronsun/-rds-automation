@@ -1,0 +1,456 @@
+# Serverless RDS Cluster Automation
+
+Provision AWS Aurora RDS clusters on demand via a single HTTP request.  
+A POST to the API triggers an asynchronous pipeline that opens a reviewed,
+auditable GitHub Pull Request containing the Terraform code for the new cluster.
+Merging that PR provisions the database through CI/CD — no manual AWS Console work required.
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  CALLER                                                             │
+│  curl -X POST /provision  {"cluster_name","environment","engine"}  │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ HTTPS + x-api-key header
+                             ▼
+                   ┌──────────────────┐
+                   │   API Gateway    │  POST /provision
+                   │  (API Key auth)  │  → 202 Accepted immediately
+                   └────────┬─────────┘
+                            │ AWS service proxy (no Lambda in hot path)
+                            ▼
+                   ┌──────────────────┐
+                   │    SNS Topic     │  rds-provisioning-{env}
+                   │  (fan-out hub)   │  Encrypted with AWS KMS
+                   └────────┬─────────┘
+                            │ subscription
+                            ▼
+                   ┌──────────────────┐
+                   │    SQS Queue     │  VisibilityTimeout: 360s
+                   │  + Dead Letter   │  Retry: 3× → DLQ after failure
+                   └────────┬─────────┘
+                            │ event source mapping (BatchSize: 1)
+                            ▼
+                   ┌──────────────────┐
+                   │  Lambda Function │  Python 3.12, VPC-attached
+                   │  handler.py      │  X-Ray tracing enabled
+                   └────────┬─────────┘
+                            │
+               ┌────────────┼────────────┐
+               │                         │
+               ▼                         ▼
+    ┌──────────────────┐      ┌──────────────────────┐
+    │  Secrets Manager │      │      GitHub API       │
+    │  GitHub PAT      │      │  1. Create branch     │
+    │  RDS Credentials │      │  2. Commit .tf file   │
+    └──────────────────┘      │  3. Open Pull Request │
+                              └──────────┬───────────┘
+                                         │
+                              ┌──────────▼───────────┐
+                              │  PR reviewed & merged │
+                              └──────────┬───────────┘
+                                         │ triggers
+                                         ▼
+                              ┌──────────────────────┐
+                              │  CircleCI Pipeline   │
+                              │  terraform plan      │
+                              │  [manual approval]   │
+                              │  terraform apply     │
+                              └──────────┬───────────┘
+                                         │
+                                         ▼
+                              ┌──────────────────────┐
+                              │  AWS RDS Aurora      │
+                              │  Cluster — LIVE      │
+                              │  Password → Secrets  │
+                              │  Manager (auto-gen)  │
+                              └──────────────────────┘
+```
+
+### Why this design?
+
+| Decision | Reason |
+|---|---|
+| API GW → SNS direct integration | No Lambda in the HTTP request path — lower latency, instant 202 response |
+| SNS between API GW and SQS | Fan-out: future consumers (audit log, Slack alerts) subscribe without changing existing code |
+| SQS with DLQ | Automatic retries (×3), failed messages land in DLQ for inspection — no silent drops |
+| BatchSize: 1 | RDS provisioning is stateful and heavyweight; parallelism here would be dangerous |
+| PR-based provisioning | Every cluster has a code review, git history, and a rollback path (delete the file, apply again) |
+| Secrets Manager for all credentials | Zero secrets in environment variables, source code, or CI logs |
+
+---
+
+## Folder Structure
+
+```
+project-root/
+│
+├── .circleci/
+│   └── config.yml              # CI/CD pipeline (two workflows: pr-checks, deploy)
+│
+├── serverless/                 # AWS SAM application
+│   ├── src/
+│   │   ├── handler.py          # Lambda — parses SQS, calls GitHub API, opens PR
+│   │   └── requirements.txt    # PyGithub, boto3
+│   └── template.yaml           # SAM template: API GW, SNS, SQS, Lambda, IAM, API Key
+│
+├── terraform-modules/
+│   └── rds-cluster/            # Reusable Terraform module (called by generated files)
+│       ├── main.tf             # Aurora cluster, Secrets Manager, Security Group
+│       ├── variables.tf        # All inputs (env, engine, vpc, subnets…)
+│       └── outputs.tf          # Endpoints, secret ARN, SG ID
+│
+├── clusters/                   # Auto-generated by Lambda — DO NOT edit manually
+│   ├── backend.tf              # S3 state backend (partial config, values from CI)
+│   ├── variables.tf            # vpc_id, subnet_ids, allowed_security_group_ids
+│   └── <cluster_name>.tf       # One file per provisioned cluster (generated by Lambda)
+│
+├── .gitignore                  # Blocks secrets, state files, SAM artifacts, .env
+└── README.md                   # This file
+```
+
+> **Note:** The `clusters/` directory must be bootstrapped once manually before Lambda
+> starts generating files. See [Bootstrap clusters/](#bootstrap-clusters) below.
+
+---
+
+## Prerequisites
+
+| Tool | Minimum version | Install |
+|---|---|---|
+| AWS CLI | v2 | https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html |
+| AWS SAM CLI | v1.100 | `pip install aws-sam-cli` |
+| Terraform | v1.6 | https://developer.hashicorp.com/terraform/install |
+| Python | 3.12 | https://www.python.org/downloads/ |
+| GitHub PAT | — | Repo scope: `repo` (create branches, files, PRs) |
+
+---
+
+## Pre-deployment: Store Secrets in AWS Secrets Manager
+
+**Never** put credentials in environment variables, config files, or CI job definitions.
+Store them in Secrets Manager first:
+
+```bash
+# 1. GitHub Personal Access Token (plain string)
+aws secretsmanager create-secret \
+  --name "dev/rds-automation/github-token" \
+  --description "GitHub PAT for serverless-rds-automation" \
+  --secret-string "ghp_YOUR_TOKEN_HERE"
+
+# 2. Note the ARN from the output — you will pass it as GitHubTokenSecretArn
+#    e.g. arn:aws:secretsmanager:us-east-1:123456789012:secret:dev/rds-automation/github-token-AbCdEf
+```
+
+The RDS master-credentials secret is created **automatically** by the Terraform module
+when you run `terraform apply` on the `rds-cluster` module. Its ARN is exposed as
+the `secret_arn` Terraform output.
+
+---
+
+## Bootstrap `clusters/`
+
+The `clusters/` directory is already present in this repository with the two
+required bootstrap files (`backend.tf` and `variables.tf`). No manual action
+is needed — they are committed and ready for CI to use.
+
+When the Lambda opens a provisioning PR, the generated file is added to this
+directory alongside these bootstrap files.
+
+---
+
+## Deployment Instructions
+
+### Step 1 — Create the SAM artifact S3 bucket
+
+```bash
+aws s3 mb s3://your-sam-artifacts-bucket --region us-east-1
+```
+
+### Step 2 — Create the Terraform state S3 bucket
+
+```bash
+aws s3 mb s3://your-tf-state-bucket --region us-east-1
+
+# Enable versioning for state recovery
+aws s3api put-bucket-versioning \
+  --bucket your-tf-state-bucket \
+  --versioning-configuration Status=Enabled
+```
+
+### Step 3 — Build and deploy the SAM stack
+
+```bash
+cd serverless
+
+sam build
+
+sam deploy \
+  --stack-name              rds-automation-dev \
+  --s3-bucket               your-sam-artifacts-bucket \
+  --region                  us-east-1 \
+  --capabilities            CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    "Environment=dev" \
+    "RdsSecretArn=arn:aws:secretsmanager:us-east-1:123456789012:secret:dev/mydb/db-credentials-XxXxXx" \
+    "GitHubTokenSecretArn=arn:aws:secretsmanager:us-east-1:123456789012:secret:dev/rds-automation/github-token-AbCdEf" \
+    "LambdaSubnetIds=subnet-aaa,subnet-bbb" \
+    "LambdaSecurityGroupId=sg-0123456789abcdef0" \
+    "GitHubRepo=your-org/your-iac-repo" \
+    "GitHubBaseBranch=main" \
+    "CustomDomainName=rds-api.example.com" \
+    "AcmCertificateArn=arn:aws:acm:us-east-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
+    "ClusterTtlDays=30"
+```
+
+### Step 4 — Configure the custom domain DNS
+
+After deploy, get the regional target from the stack outputs:
+
+```bash
+REGIONAL_DOMAIN=$(aws cloudformation describe-stacks \
+  --stack-name rds-automation-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='RegionalDomainName'].OutputValue" \
+  --output text)
+
+echo "Create a CNAME: rds-api.example.com → $REGIONAL_DOMAIN"
+```
+
+| DNS provider | Action |
+|---|---|
+| **Route 53** | Create an **Alias** record pointing to `$REGIONAL_DOMAIN` |
+| **Other providers** | Create a **CNAME** record pointing to `$REGIONAL_DOMAIN` |
+
+> **Note:** The ACM certificate must be issued and in `ISSUED` status before deploying.
+> Create it with `aws acm request-certificate --domain-name rds-api.example.com --validation-method DNS`
+> and complete DNS validation first.
+
+### Step 5 — Retrieve the API Key value
+
+```bash
+# Get the key ID from the stack output
+KEY_ID=$(aws cloudformation describe-stacks \
+  --stack-name rds-automation-dev \
+  --query "Stacks[0].Outputs[?OutputKey=='ApiKeyId'].OutputValue" \
+  --output text)
+
+# Get the actual secret key value
+aws apigateway get-api-key \
+  --api-key "$KEY_ID" \
+  --include-value \
+  --query "value" \
+  --output text
+```
+
+> Store this value in your password manager or as a CircleCI environment variable.
+> Do **not** commit it anywhere.
+
+### Step 5 — Configure CircleCI
+
+In your CircleCI project, create two **Contexts**:
+
+**Context: `aws-readonly`** (used on PRs)
+| Variable | Value |
+|---|---|
+| `AWS_ACCESS_KEY_ID` | IAM user with read-only Terraform permissions |
+| `AWS_SECRET_ACCESS_KEY` | — |
+| `AWS_DEFAULT_REGION` | e.g. `us-east-1` |
+| `TF_STATE_BUCKET` | your-tf-state-bucket |
+| `TF_VPC_ID` | vpc-xxxxxxxxxxxxxxxxx |
+| `TF_SUBNET_IDS` | `["subnet-aaa","subnet-bbb"]` |
+| `TF_ALLOWED_SGS` | `["sg-0123456789abcdef0"]` |
+
+**Context: `aws-deploy`** (used on `main` only — all of the above, plus:)
+| Variable | Value |
+|---|---|
+| `SAM_STACK_NAME` | rds-automation-dev |
+| `SAM_ARTIFACT_BUCKET` | your-sam-artifacts-bucket |
+| `DEPLOY_ENVIRONMENT` | dev |
+| `RDS_SECRET_ARN` | ARN from Terraform output |
+| `GITHUB_TOKEN_SECRET_ARN` | ARN from Step — Pre-deployment |
+| `LAMBDA_SUBNET_IDS` | subnet-aaa,subnet-bbb |
+| `LAMBDA_SG_ID` | sg-0123456789abcdef0 |
+
+---
+
+## Usage — Sending a Provisioning Request
+
+```bash
+# Set your variables
+API_URL="https://<api-id>.execute-api.us-east-1.amazonaws.com/dev/provision"
+API_KEY="your-api-key-value-from-step-4"
+
+# Send a provisioning request
+curl -X POST "$API_URL" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $API_KEY" \
+  -d '{
+    "cluster_name": "payments-db",
+    "environment": "dev",
+    "engine":      "postgres"
+  }'
+```
+
+**Expected response (202 Accepted):**
+```json
+{
+  "message": "Provisioning request accepted",
+  "requestId": "abc12345-..."
+}
+```
+
+### What happens next
+
+1. The message travels: API GW → SNS → SQS → Lambda
+2. Lambda opens a PR in your IaC repo at `clusters/payments-db.tf`
+3. Your team reviews and merges the PR
+4. CircleCI detects the change in `clusters/`, runs `terraform plan`
+5. A team member approves the plan in the CircleCI UI
+6. CircleCI runs `terraform apply` — the Aurora cluster is live
+
+### Full payload reference
+
+| Field | Required | Type | Values |
+|---|---|---|---|
+| `cluster_name` | ✅ | string | Lowercase, alphanumeric and hyphens |
+| `environment` | ✅ | string | `dev` \| `prod` |
+| `engine` | ✅ | string | `mysql` \| `postgres` |
+| `database_name` | ❌ | string | Defaults to `cluster_name` |
+| `master_username` | ❌ | string | Defaults to `dbadmin` |
+
+---
+
+## Security Model
+
+### Secrets — where they live and how they flow
+
+```
+GitHub PAT ──────────────────────────────→ AWS Secrets Manager
+                                                    │
+                                           Lambda reads at runtime
+                                           (cached per container)
+                                                    │
+                                           Never in: env vars,
+                                           logs, source code, or CI
+
+RDS master password ─→ random_password ──→ AWS Secrets Manager
+  (generated by Terraform)                          │
+                                           Lambda SG gets inbound
+                                           access to RDS port only
+
+API Key value ───────────────────────────→ AWS API Gateway
+                                           (AWS-managed, not stored
+                                            in code or CI vars)
+```
+
+### IAM — least privilege summary
+
+| Identity | What it can do |
+|---|---|
+| **API Gateway role** | `sns:Publish` on the provisioning topic only |
+| **Lambda execution role** | SQS consume (one queue), `secretsmanager:GetSecretValue` (two explicit ARNs), CloudWatch Logs (one log group), X-Ray |
+| **CircleCI `aws-readonly`** | Terraform plan, S3 state read — no writes |
+| **CircleCI `aws-deploy`** | Terraform apply, SAM deploy, CloudFormation — scoped to provisioning resources |
+
+### Network isolation
+
+- Lambda runs inside a VPC on private subnets
+- RDS accepts connections only from the Lambda Security Group — no public access, no CIDR-based rules
+- No resources expose a public IP
+
+### Encryption at rest
+
+- SQS queues encrypted with `alias/aws/sqs`
+- SNS topic encrypted with `alias/aws/sns`
+- RDS cluster has `storage_encrypted = true`
+- All secrets in Secrets Manager are encrypted with the AWS-managed KMS key
+
+---
+
+## Environment Differences (dev vs prod)
+
+| Setting | `dev` | `prod` |
+|---|---|---|
+| RDS instance class | `db.t3.medium` | `db.r6g.large` |
+| Number of instances | 1 (writer only) | 2 (writer + reader) |
+| Deletion protection | off | **on** |
+| Final snapshot on destroy | skipped | taken |
+| Backup retention | 1 day | 7 days |
+| Performance Insights | off | on |
+| Secrets Manager recovery window | 0 days (instant delete) | 30 days |
+| CloudWatch log retention | 14 days | 90 days |
+
+---
+
+## Auto-Cleanup (Bonus Feature)
+
+A second Lambda (`rds-cleanup-{env}`) runs automatically every day at **02:00 UTC**.
+
+### How it works
+
+```
+EventBridge (daily 02:00 UTC)
+        │
+        ▼
+  Cleanup Lambda
+        │
+        ├── Calls rds:DescribeDBClusters + rds:ListTagsForResource
+        ├── Finds clusters tagged AutoProvisioned=true
+        │   whose RequestedAt age > ClusterTtlDays (default: 30)
+        │
+        └── For each expired cluster:
+              Opens a GitHub PR that deletes clusters/<name>.tf
+                        │
+                        ▼
+              Human reviews and merges
+                        │
+                        ▼
+              CircleCI → terraform apply → cluster destroyed
+```
+
+### Configuring the TTL
+
+Set `ClusterTtlDays` at deploy time:
+
+```bash
+# Clusters expire after 7 days in dev, 90 days in prod
+--parameter-overrides "ClusterTtlDays=7"
+```
+
+Or update the running stack without redeploying everything:
+
+```bash
+aws cloudformation update-stack \
+  --stack-name rds-automation-dev \
+  --use-previous-template \
+  --parameters ParameterKey=ClusterTtlDays,ParameterValue=14 \
+               ParameterKey=Environment,UsePreviousValue=true \
+               # ... other params with UsePreviousValue=true
+```
+
+### Important — prod clusters
+
+Prod clusters have `deletion_protection = true` in Terraform. Before merging a
+cleanup PR for a prod cluster, you must first open a separate PR to set
+`deletion_protection = false`, apply it, and then merge the cleanup PR.
+
+---
+
+## Monitoring & Alerts
+
+| What to watch | Why |
+|---|---|
+| `ApproximateNumberOfMessagesVisible` on the **DLQ** | Any value > 0 means a provisioning request failed 3 times — investigate immediately |
+| Lambda `Errors` metric | Transient failures that will be retried |
+| Lambda `Duration` metric | Timeout at 300s would indicate a GitHub API or network issue |
+| CloudFormation stack events | For SAM deploy failures |
+| Terraform state in S3 | Enable versioning and MFA delete on the state bucket |
+
+---
+
+## License
+
+MIT

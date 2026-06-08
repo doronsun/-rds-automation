@@ -1,0 +1,505 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless RDS Cluster Automation
+  Request flow: POST /provision → API Gateway → SNS → SQS → Lambda → GitHub PR
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PARAMETERS
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+
+  # ARN of the secret that holds the GitHub Personal Access Token.
+  # Create it once with: aws secretsmanager create-secret --name dev/rds-automation/github-token --secret-string "ghp_..."
+  GitHubTokenSecretArn:
+    Type: String
+
+  # ARN of the RDS master-credentials secret (output of the terraform-modules/rds-cluster module).
+  # For the INITIAL SAM deployment (before any Terraform has run), pass the placeholder
+  # secret ARN created during setup. Update the stack after the first cluster is provisioned.
+  RdsSecretArn:
+    Type: String
+    Default: "arn:aws:secretsmanager:us-east-1:220755213262:secret:dev/rds-automation/rds-placeholder"
+
+  GitHubRepo:
+    Type: String
+    Description: "GitHub repo in owner/repo format, e.g. myuser/rds-automation"
+    AllowedPattern: ".+/.+"
+
+  GitHubBaseBranch:
+    Type: String
+    Default: "main"
+
+  # ── Custom domain (OPTIONAL) ───────────────────────────────────────────────
+  # Leave blank to skip custom domain creation and use the default API GW URL.
+  CustomDomainName:
+    Type: String
+    Default: ""
+    Description: "e.g. rds-api.example.com — leave blank to skip"
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: "ACM cert ARN in the SAME region — required only when CustomDomainName is set"
+
+  # ── Cleanup TTL ────────────────────────────────────────────────────────────
+  ClusterTtlDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONDITIONS
+# ──────────────────────────────────────────────────────────────────────────────
+Conditions:
+  IsProd: !Equals [!Ref Environment, "prod"]
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, ""]]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GLOBALS
+# ──────────────────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        RDS_SECRET_ARN: !Ref RdsSecretArn
+        GITHUB_TOKEN_SECRET_ARN: !Ref GitHubTokenSecretArn
+        GITHUB_REPO: !Ref GitHubRepo
+        GITHUB_BASE_BRANCH: !Ref GitHubBaseBranch
+
+Resources:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SQS — DLQ first so the main queue can reference its ARN
+  # ────────────────────────────────────────────────────────────────────────────
+
+  RdsProvisioningDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "rds-provisioning-dlq-${Environment}"
+      MessageRetentionPeriod: 1209600   # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  RdsProvisioningQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "rds-provisioning-${Environment}"
+      VisibilityTimeout: 360            # Must be > Lambda Timeout (300s)
+      MessageRetentionPeriod: 86400
+      KmsMasterKeyId: alias/aws/sqs
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt RdsProvisioningDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  RdsProvisioningQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref RdsProvisioningQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSnsTopicSend
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt RdsProvisioningQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref RdsProvisioningTopic
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # SNS
+  # ────────────────────────────────────────────────────────────────────────────
+
+  RdsProvisioningTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "rds-provisioning-${Environment}"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: SAM
+
+  RdsProvisioningSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: RdsProvisioningQueuePolicy
+    Properties:
+      TopicArn: !Ref RdsProvisioningTopic
+      Protocol: sqs
+      Endpoint: !GetAtt RdsProvisioningQueue.Arn
+      RawMessageDelivery: true
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # API GATEWAY — direct AWS service integration to SNS (no Lambda in hot path)
+  # ────────────────────────────────────────────────────────────────────────────
+
+  ApiGatewayPublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "apigw-sns-publish-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublishToRdsTopic
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref RdsProvisioningTopic
+
+  ProvisioningApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      TracingEnabled: true
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: NONE
+      DefinitionBody:
+        Fn::Sub: |
+          openapi: "3.0.1"
+          info:
+            title: "RDS Provisioning API"
+            version: "1.0.0"
+          x-amazon-apigateway-api-key-source: HEADER
+          components:
+            securitySchemes:
+              ApiKeyAuth:
+                type: apiKey
+                in: header
+                name: x-api-key
+          paths:
+            /provision:
+              post:
+                summary: "Submit an RDS cluster provisioning request"
+                security:
+                  - ApiKeyAuth: []
+                requestBody:
+                  required: true
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+                        required: [cluster_name, environment, engine]
+                        properties:
+                          cluster_name:
+                            type: string
+                            example: "my-app-db"
+                          environment:
+                            type: string
+                            enum: [dev, prod]
+                          engine:
+                            type: string
+                            enum: [mysql, postgres]
+                responses:
+                  "202":
+                    description: "Request accepted for async processing"
+                  "400":
+                    description: "Invalid request body"
+                  "403":
+                    description: "Missing or invalid x-api-key header"
+                x-amazon-apigateway-integration:
+                  type: aws
+                  httpMethod: POST
+                  uri: "arn:aws:apigateway:${AWS::Region}:sns:action/Publish"
+                  credentials: "${ApiGatewayPublishRole.Arn}"
+                  requestParameters:
+                    integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                  requestTemplates:
+                    application/json: "Action=Publish&TopicArn=$util.urlEncode(\"${RdsProvisioningTopic}\")&Message=$util.urlEncode($input.body)"
+                  passthroughBehavior: NEVER
+                  responses:
+                    default:
+                      statusCode: "202"
+                      responseTemplates:
+                        application/json: "{\"message\":\"Provisioning request accepted\",\"requestId\":\"$context.requestId\"}"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # CUSTOM DOMAIN — conditional (only when CustomDomainName != "")
+  # ────────────────────────────────────────────────────────────────────────────
+
+  ApiCustomDomain:
+    Type: AWS::ApiGateway::DomainName
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref CustomDomainName
+      RegionalCertificateArn: !Ref AcmCertificateArn
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      SecurityPolicy: TLS_1_2
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: HasCustomDomain
+    DependsOn: ProvisioningApiStage
+    Properties:
+      DomainName: !Ref ApiCustomDomain
+      RestApiId: !Ref ProvisioningApi
+      Stage: !Ref Environment
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # API KEY + USAGE PLAN
+  # ────────────────────────────────────────────────────────────────────────────
+
+  ProvisioningApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ProvisioningApiStage
+    Properties:
+      Name: !Sub "rds-provisioning-key-${Environment}"
+      Description: !Sub "API key for RDS Provisioning endpoint (${Environment})"
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref ProvisioningApi
+          StageName: !Ref Environment
+
+  ProvisioningUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ProvisioningApiKey
+    Properties:
+      UsagePlanName: !Sub "rds-provisioning-plan-${Environment}"
+      ApiStages:
+        - ApiId: !Ref ProvisioningApi
+          Stage: !Ref Environment
+      Throttle:
+        BurstLimit: 5
+        RateLimit: 2
+      Quota:
+        Limit: 100
+        Period: DAY
+
+  ProvisioningUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ProvisioningApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ProvisioningUsagePlan
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # LAMBDA — Provisioning (NO VPC: Lambda calls GitHub API only, not RDS)
+  # ────────────────────────────────────────────────────────────────────────────
+
+  RdsProvisioningFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "rds-provisioning-fn-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SqsConsumeMessages
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt RdsProvisioningQueue.Arn
+
+        - PolicyName: SecretsManagerReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRdsCredentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref RdsSecretArn
+              - Sid: ReadGitHubToken
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GitHubTokenSecretArn
+
+        - PolicyName: CloudWatchLogsWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/rds-provisioning-${Environment}:*"
+
+        - PolicyName: XRayTracing
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+
+  RdsProvisioningFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "rds-provisioning-${Environment}"
+      CodeUri: src/
+      Handler: handler.lambda_handler
+      Role: !GetAtt RdsProvisioningFunctionRole.Arn
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt RdsProvisioningQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  RdsProvisioningLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/rds-provisioning-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # LAMBDA — Cleanup (daily EventBridge schedule)
+  # ────────────────────────────────────────────────────────────────────────────
+
+  CleanupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "rds-cleanup-fn-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RdsDescribeClusters
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                  - rds:ListTagsForResource
+                Resource: "*"
+        - PolicyName: SecretsManagerReadGitHubToken
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GitHubTokenSecretArn
+        - PolicyName: CloudWatchLogsWriteCleanup
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/rds-cleanup-${Environment}:*"
+        - PolicyName: XRayTracingCleanup
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+
+  CleanupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "rds-cleanup-${Environment}"
+      CodeUri: src/
+      Handler: handler.cleanup_handler
+      Role: !GetAtt CleanupFunctionRole.Arn
+      Environment:
+        Variables:
+          CLUSTER_TTL_DAYS: !Ref ClusterTtlDays
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: "cron(0 2 * * ? *)"
+            Description: !Sub "Scan for RDS clusters older than ${ClusterTtlDays} days"
+            Enabled: true
+
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/rds-cleanup-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OUTPUTS
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  ApiEndpoint:
+    Description: "Default API GW URL — use this when CustomDomainName is blank"
+    Value: !Sub "https://${ProvisioningApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/provision"
+
+  CustomDomainEndpoint:
+    Condition: HasCustomDomain
+    Description: "Custom domain endpoint (requires DNS CNAME after deploy)"
+    Value: !Sub "https://${CustomDomainName}/provision"
+
+  RegionalDomainName:
+    Condition: HasCustomDomain
+    Description: "Point your DNS CNAME to this value"
+    Value: !GetAtt ApiCustomDomain.RegionalDomainName
+
+  ApiKeyId:
+    Description: "Retrieve key value: aws apigateway get-api-key --api-key <ID> --include-value"
+    Value: !Ref ProvisioningApiKey
+
+  SnsTopicArn:
+    Value: !Ref RdsProvisioningTopic
+
+  SqsQueueUrl:
+    Value: !Ref RdsProvisioningQueue
+
+  DlqUrl:
+    Value: !Ref RdsProvisioningDLQ
+
+  LambdaFunctionArn:
+    Value: !GetAtt RdsProvisioningFunction.Arn
+
+  CleanupFunctionArn:
+    Value: !GetAtt CleanupFunction.Arn
