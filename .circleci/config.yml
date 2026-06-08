@@ -230,8 +230,8 @@ jobs:
                 "Environment=${DEPLOY_ENVIRONMENT}" \
                 "RdsSecretArn=${RDS_SECRET_ARN}" \
                 "GitHubTokenSecretArn=${GITHUB_TOKEN_SECRET_ARN}" \
-                "LambdaSubnetIds=${LAMBDA_SUBNET_IDS}" \
-                "LambdaSecurityGroupId=${LAMBDA_SG_ID}"
+                "GitHubRepo=${GITHUB_REPO}" \
+                "GitHubBaseBranch=${GITHUB_BASE_BRANCH}"
       - run:
           name: Print CloudFormation stack outputs
           command: |
