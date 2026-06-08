@@ -87,7 +87,7 @@ Resources:
     Properties:
       QueueName: !Sub "rds-provisioning-dlq-${Environment}"
       MessageRetentionPeriod: 1209600   # 14 days
-      KmsMasterKeyId: alias/aws/sqs
+      SqsManagedSseEnabled: true
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -100,7 +100,7 @@ Resources:
       QueueName: !Sub "rds-provisioning-${Environment}"
       VisibilityTimeout: 360            # Must be > Lambda Timeout (300s)
       MessageRetentionPeriod: 86400
-      KmsMasterKeyId: alias/aws/sqs
+      SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt RdsProvisioningDLQ.Arn
         maxReceiveCount: 3
@@ -181,10 +181,6 @@ Resources:
     Properties:
       StageName: !Ref Environment
       TracingEnabled: true
-      Auth:
-        ApiKeyRequired: true
-        UsagePlan:
-          CreateUsagePlan: NONE
       DefinitionBody:
         Fn::Sub: |
           openapi: "3.0.1"

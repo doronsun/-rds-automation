@@ -21,11 +21,8 @@ from github import Github, GithubException
 # ---------------------------------------------------------------------------
 # Logging — emit one JSON line per log call so CloudWatch Insights can query it
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"time":"%(asctime)s","level":"%(levelname)s","msg":%(message)s}',
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Module-level constants — resolved once per Lambda container lifetime
