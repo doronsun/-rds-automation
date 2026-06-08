@@ -14,7 +14,10 @@ import sys
 import types
 from unittest.mock import MagicMock, patch, call
 
+import os
 import pytest
+
+_HANDLER_PATH = os.path.join(os.path.dirname(__file__), "..", "src", "handler.py")
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +51,7 @@ def _load_handler():
             del sys.modules["handler"]
         spec = importlib.util.spec_from_file_location(
             "handler",
-            "/Users/doronsun/home_assignmet/serverless/src/handler.py",
+            _HANDLER_PATH,
         )
         mod = importlib.util.module_from_spec(spec)
         sys.modules["handler"] = mod
